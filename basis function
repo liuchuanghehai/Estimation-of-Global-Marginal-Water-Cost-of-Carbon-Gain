@@ -1,0 +1,91 @@
+import glob
+from osgeo import gdal, osr
+import numpy as np
+import xarray as xr
+from datetime import datetime
+from scipy.ndimage import zoom
+from rasterio.transform import from_origin
+import rasterio
+import os
+from rasterio import Affine
+from rasterio.enums import Resampling
+import rioxarray
+
+# Read raster data from a GeoTIFF file
+def get_data(name):
+    # Open TIFF file in read-only mode
+    dataset = gdal.Open(name, gdal.GA_ReadOnly)
+    # Read the first raster band as a NumPy array
+    band = dataset.GetRasterBand(1)
+    data = np.array(band.ReadAsArray())
+    # Retrieve and apply NoData value
+    no_data_value = band.GetNoDataValue()
+    data[data == no_data_value] = 0
+    data[data == 65535] = 0  # Common invalid value placeholder
+    return data
+
+# Resample raster to a coarser resolution and add an empty row at the bottom
+def resample_grid_with_empty_row(grid, old_resolution, new_resolution):
+    """
+    Resample a raster grid from higher to lower resolution and append an empty row at the bottom.
+    :param grid: Input 2D NumPy array of raster values
+    :param old_resolution: Original grid resolution
+    :param new_resolution: Target grid resolution
+    :return: Resampled grid with one NaN row appended at the bottom
+    """
+    resample_factor = old_resolution / new_resolution
+    resampled_grid = zoom(grid, resample_factor, order=1)  # Linear interpolation
+    empty_row = np.full((1, resampled_grid.shape[1]), np.nan)
+    result_grid = np.vstack([resampled_grid, empty_row])
+    return result_grid
+
+# Adjust raster vertical extent by padding with zeros (e.g., for latitudinal coverage)
+def jisuan1_fanwei1(site, input_lat_range=(89.23, -62.77), output_lat_range=(90, -90), cell_size=4/55):
+    """
+    Pad the raster vertically to match a standard global latitudinal extent.
+    :param site: Input raster file path
+    :param input_lat_range: Latitude range covered by input data
+    :param output_lat_range: Desired latitude range (default is full globe)
+    :param cell_size: Spatial resolution (default ~0.0727 deg)
+    :return: Tuple of padded raster array and updated transform
+    """
+    input_lat_size = int((input_lat_range[0] - input_lat_range[1]) / cell_size)
+    output_lat_size = int((output_lat_range[0] - output_lat_range[1]) / cell_size)
+
+    top_padding = int((output_lat_range[0] - input_lat_range[0]) / cell_size)
+    bottom_padding = int((input_lat_range[1] - output_lat_range[1]) / cell_size)
+
+    with rasterio.open(site) as src:
+        data = src.read(1)
+        transform = src.transform
+        profile = src.profile
+
+    new_data = np.zeros((output_lat_size, data.shape[1]), dtype=data.dtype)
+    new_data[top_padding:top_padding + input_lat_size, :] = data
+    new_transform = from_origin(transform.c, output_lat_range[0], cell_size, cell_size)
+    return new_data, new_transform
+
+# Save raster data (NumPy array) as a GeoTIFF using a reference file for georeferencing
+def save_tif(R, reference_layer, out_put_file):
+    RMI = R * 1  # Clone data array
+    dataset = gdal.Open(reference_layer, gdal.GA_ReadOnly)
+    band = dataset.GetRasterBand(1)
+    width = dataset.RasterXSize
+    height = dataset.RasterYSize
+    bands = dataset.RasterCount
+    geotransform = dataset.GetGeoTransform()
+    projection = dataset.GetProjection()
+
+    gtiff_driver = gdal.GetDriverByName('GTiff')
+    out_ds = gtiff_driver.Create(out_put_file, width, height, bands, gdal.GDT_Float32)
+    out_ds.SetProjection(projection)
+    out_ds.SetGeoTransform(geotransform)
+
+    # Set coordinate system explicitly to WGS84
+    sr = osr.SpatialReference()
+    sr.SetWellKnownGeogCS('WGS84')
+    out_ds.SetProjection(sr.ExportToWkt())
+
+    out_ds.GetRasterBand(1).WriteArray(RMI[::1])  # Write data to band
+    out_ds.FlushCache()  # Save to disk
+    out_ds = None  # Close file
