@@ -1,0 +1,429 @@
+# Full English-commented version of the Bayesian Neural Field (BNF) spatial-temporal prediction pipeline
+
+import time
+from osgeo import gdal, osr
+from glob import glob
+import xarray as xr
+import pandas as pd
+import numpy as np
+from typing import NamedTuple
+from bayesnf.spatiotemporal import BayesianNeuralFieldMAP
+import shutil
+import os
+import warnings
+
+warnings.filterwarnings("ignore")  # Suppress all warnings
+
+# Define the structure of model parameters to be loaded from a .npz file
+class MyStruct(NamedTuple):
+    # Each field corresponds to a parameter in the trained BNF model
+    zero_initial_log_noise_scale: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_1: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_2: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_3: np.ndarray
+    initial_weight_matrix_4: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_5: np.ndarray
+    initial_weight_matrix_6: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_7: np.ndarray
+    initial_weight_matrix_8: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_9: np.ndarray
+    initial_weight_matrix_10: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_11: np.ndarray
+    initial_weight_matrix_12: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_13: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_14: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_15: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_16: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_17: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_18: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_19: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_20: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_21: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_22: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_23: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_24: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_25: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_26: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_27: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_28: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_29: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_30: np.ndarray
+    zero_initial_mean_for_bias_or_transformed_scale_31: np.ndarray  # T_sum output weights
+
+# Function to load a trained Bayesian Neural Field model from .npz file
+
+def read_model(model_site):
+    loaded_npz = np.load(model_site)  # Load model parameters from file
+    loaded_data_dict = {key: loaded_npz[key] for key in loaded_npz}  # Store in dictionary
+
+    def extract_index(key):
+        # Helper to extract trailing index from key name
+        parts = key.rsplit('_', 1)
+        return int(parts[-1]) if parts[-1].isdigit() else 0
+
+    # Sort keys by numeric suffix to maintain proper ordering
+    sorted_keys = sorted(loaded_data_dict.keys(), key=extract_index)
+    reconstructed_data = MyStruct(*[loaded_data_dict[key] for key in sorted_keys])
+
+    # Instantiate model with same architecture used during training
+    model = BayesianNeuralFieldMAP(
+        width=256,
+        depth=4,
+        freq='W',
+        feature_cols=[
+            'TIMESTAMP', 'TA_F', 'SW_IN_F', 'LW_IN_F', 'VPD_F',
+            'TS_F_MDS_1', 'SWC_F_MDS_1', 'G_F_MDS', 'LE_F_MDS', 'H_F_MDS', 'GPP_NT_VUT_REF'
+        ],
+        target_col='T_sum',
+        observation_model='NORMAL',
+        timetype='index',
+        standardize=[
+            'TA_F', 'SW_IN_F', 'LW_IN_F', 'VPD_F',
+            'TS_F_MDS_1', 'SWC_F_MDS_1', 'G_F_MDS', 'LE_F_MDS', 'H_F_MDS', 'GPP_NT_VUT_REF'
+        ]
+    )
+    # Assign loaded parameters to model instance
+    model.params_ = reconstructed_data
+    return model
+
+# Save predicted output to GeoTIFF file using GDAL
+
+def save_to_tif_with_gdal(data, output_path, geotransform, crs):
+    data = data.values  # Convert xarray to NumPy array
+    driver = gdal.GetDriverByName("GTiff")
+    rows, cols = data.shape
+    out_tif = driver.Create(output_path, cols, rows, 1, gdal.GDT_Float32)
+
+    # Set spatial reference and transformation info
+    out_tif.SetGeoTransform(geotransform)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(int(crs.split(":")[-1]))
+    out_tif.SetProjection(srs.ExportToWkt())
+
+    # Write the array to band 1
+    out_band = out_tif.GetRasterBand(1)
+    out_band.WriteArray(data)
+    out_band.SetNoDataValue(np.nan)
+    out_band.FlushCache()
+    out_tif = None  # Close the file
+
+# Read land use raster and convert to mask indicating invalid grid points
+
+def read_land_use_tif(land_use_path):
+    dataset = gdal.Open(land_use_path, gdal.GA_ReadOnly)
+    land_use_data = dataset.ReadAsArray().astype(float)
+    land_use_data[land_use_data == 0] = np.nan  # Replace 0 with NaN
+    land_use_mask = (land_use_data == 0) | np.isnan(land_use_data)
+    dataset = None
+    return land_use_mask, land_use_data
+
+# Read single-band raster into a NumPy array
+
+def get_data(name):
+    dataset = gdal.Open(name, gdal.GA_ReadOnly)
+    band = dataset.GetRasterBand(1)
+    data = np.array(band.ReadAsArray())
+    no_data_value = band.GetNoDataValue()
+    data[data == no_data_value] = 0  # Replace nodata with 0
+    return data
+# English-commented version of `process_nc_files_by_time`
+def process_nc_files_by_time(input_dir, output_dir, land_use_file):
+    """
+    Process time-distributed NetCDF feature files, merge and align them by time,
+    integrate land use masking, append predicted GPP, run model prediction, and
+    export daily results as GeoTIFF files.
+
+    Args:
+        input_dir (str): Directory containing input NetCDF feature files.
+        output_dir (str): Directory to save the output prediction GeoTIFF files.
+        land_use_file (str): Path to the land use GeoTIFF file for masking.
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Load land use raster and create mask
+    land_use_mask, land_use_data = read_land_use_tif(land_use_file)
+
+    # Find all NetCDF files in the input directory
+    all_files = glob(os.path.join(input_dir, "*.nc"))
+    feature_files = {}
+
+    for file in all_files:
+        file_name = os.path.basename(file)
+        parts = file_name.split("_")
+        if len(parts) >= 3 and parts[0].startswith("e"):
+            feature_name = f'{parts[3:]}'
+            # Map raw filename segments to canonical feature names
+            if feature_name == "['TA', 'F.nc']":
+                feature_name = 'TA_F'
+            elif feature_name == "['mean', 'surface', 'downward', 'long', 'wave', 'radiation', 'flux.nc']":
+                feature_name = 'LW_IN_F'
+            elif feature_name == "['mean', 'surface', 'downward', 'short', 'wave', 'radiation', 'flux.nc']":
+                feature_name = 'SW_IN_F'
+            elif feature_name == "['VPD', 'F.nc']":
+                feature_name = 'VPD_F'
+            elif feature_name == "['TS', 'F', 'MDS', '1.nc']":
+                feature_name = 'TS_F_MDS_1'
+            elif feature_name == "['SWC', 'F', 'MDS', '1.nc']":
+                feature_name = 'SWC_F_MDS_1'
+            elif feature_name == "['gf.nc']":
+                feature_name = 'G_F_MDS'
+            elif feature_name == "['lh.nc']":
+                feature_name = 'LE_F_MDS'
+            elif feature_name == "['sh.nc']":
+                feature_name = 'H_F_MDS'
+            else:
+                continue
+
+            time_stamp = f'{parts[1].split(".")[0]}{parts[2]}'
+            if '[' in file_name:
+                feature_files[time_stamp] = {}  # Skip malformed filenames
+            else:
+                feature_files.setdefault(time_stamp, {})[feature_name] = file
+
+    # Iterate over each timestamp group of feature files
+    for time_stamp, files in feature_files.items():
+        feature_names = sorted(files.keys())
+        if len(feature_names) < 8:
+            print(f"Insufficient features for {time_stamp}, skipping...")
+            continue
+
+        # Open each feature NetCDF dataset
+        datasets = {name: xr.open_dataset(files[name]) for name in feature_names}
+
+        # Determine common time range (intersection) across datasets
+        min_days = float('inf')
+        min_date_range = None
+        for name, ds in datasets.items():
+            if "valid_time" not in ds.dims:
+                print(f"Missing time dimension in {name}, skipping...")
+                continue
+            dates = pd.to_datetime(ds['valid_time'].values)
+            if len(dates) < min_days:
+                min_days = len(dates)
+                min_date_range = dates
+
+        if min_date_range is None:
+            print(f"Cannot determine date range for {time_stamp}, skipping...")
+            continue
+
+        # Align all datasets to the minimum common time range
+        datasets_aligned = {}
+        for name, ds in datasets.items():
+            if "valid_time" in ds.dims:
+                try:
+                    datasets_aligned[name] = ds.sel(
+                        valid_time=ds["valid_time"].where(ds["valid_time"].isin(min_date_range), drop=True)
+                    )
+                except KeyError:
+                    print(f"Failed to align {name}, skipping...")
+                    continue
+
+        # Merge aligned datasets into one multi-variable dataset
+        try:
+            ds_combined = xr.merge([
+                datasets_aligned[name].rename({list(datasets_aligned[name].data_vars)[0]: name})
+                for name in datasets_aligned
+            ])
+            print(f"Successfully merged data for {time_stamp}")
+        except Exception as e:
+            print(f"Failed to merge data for {time_stamp}: {e}")
+            continue
+
+        # Confirm time dimension exists in merged dataset
+        time_dim = "valid_time" if "valid_time" in ds_combined.dims else None
+        if time_dim is None:
+            print(f"Merged data for {time_stamp} lacks time dimension, skipping...")
+            continue
+
+        # Convert time to YYYYMMDD format
+        time_values = pd.to_datetime(ds_combined[time_dim].values).strftime("%Y%m%d")
+        feature_names.append('GPP_NT_VUT_REF')  # Add placeholder for GPP data
+
+        for t_idx, daily_time in enumerate(time_values):
+            # Read predicted GPP as input feature
+            gpp = get_data(f'F:\\out_put_gpp\\output\\predicted_{daily_time}.tif')
+            gpp = np.nan_to_num(gpp, nan=0.0)
+
+            # Extract a single time slice of all features
+            daily_data = ds_combined.isel({time_dim: t_idx})
+            daily_data['GPP_NT_VUT_REF'] = (('latitude', 'longitude'), gpp)
+
+            # Convert to flattened DataFrame for prediction
+            coords = daily_data[feature_names[0]].stack(flat_dim=daily_data[feature_names[0]].dims).coords
+            df = pd.DataFrame({
+                name: daily_data[name].stack(flat_dim=daily_data[name].dims).values for name in feature_names
+            })
+            df["TIMESTAMP"] = daily_time
+
+            # Mask invalid data using NaN and land use mask
+            nan_mask = df.isna().any(axis=1)
+            flat_land_use_mask = pd.Series(land_use_mask.flatten())
+            nan_mask_sum = ~(~nan_mask & ~flat_land_use_mask)
+            valid_data = df[~nan_mask_sum]
+            valid_data['TIMESTAMP'] = pd.to_datetime(valid_data['TIMESTAMP'])
+
+            # Run model prediction
+            yhat, yhat_quantiles = model.predict(valid_data, quantiles=(0.025, 0.5, 0.975))
+            predictions = yhat_quantiles[1]  # Use median prediction
+
+            # Fill results back into grid
+            full_predictions = np.full(df.shape[0], np.nan, dtype=np.float32)
+            full_predictions[~nan_mask_sum] = predictions
+
+            reshaped_predictions = xr.DataArray(
+                full_predictions.reshape(daily_data[feature_names[0]].shape),
+                dims=daily_data[feature_names[0]].dims,
+                coords=daily_data[feature_names[0]].coords,
+                name="predicted_gpp"
+            )
+
+            # Save prediction to GeoTIFF
+            geotransform = (
+                daily_data.longitude.min().item(),
+                abs(daily_data.longitude[1] - daily_data.longitude[0]).item(),
+                0,
+                daily_data.latitude.max().item(),
+                0,
+                -abs(daily_data.latitude[1] - daily_data.latitude[0]).item(),
+            )
+            output_tif_path = os.path.join(output_dir, f"predicted_{daily_time}.tif")
+            save_to_tif_with_gdal(reshaped_predictions, output_tif_path, geotransform, "EPSG:4326")
+            print(f"Prediction saved for {daily_time} → {output_tif_path}")
+
+        # Close all datasets for current timestamp
+        for ds in datasets.values():
+            ds.close()
+# English-commented version of `__main__` execution block
+if __name__ == '__main__':
+    # Load the trained BNF model from .npz
+    model = read_model('model_Tsum.npz')
+
+    # Define input/output directories and land use mask path
+    input_directory = "F:\\down\\example"  # Initial input directory (later replaced)
+    output_directory = "F:\\out_have_gpp_t\\output"  # Directory for saving prediction results
+    land_use = 'D:\\et_t\\土壤\\land_use1_ProjectRaster1_Pro1.tif'
+
+    # Overwrite input directory with working folder containing features for prediction
+    input_directory = 'F:\\out_have_gpp_t\\use_caluater'
+
+    # Get all available downloaded ERA5 NetCDF files
+    file_name = glob('F:\\down_sum\\*.nc')
+
+    # Define variable names needed for constructing feature set
+    var_down = [
+        "2m_temperature",
+        "mean_surface_downward_long_wave_radiation_flux",
+        "mean_surface_downward_short_wave_radiation_flux",
+        "mean_surface_latent_heat_flux",
+        "mean_surface_sensible_heat_flux",
+        "evaporation",
+        "2m_dewpoint_temperature",
+        "surface_net_solar_radiation",
+        "soil_temperature_level_1",
+        "volumetric_soil_water_layer_1"
+    ]
+
+    # Utility function to delete all files in a given folder
+    def delete_files_in_folder(folder_path):
+        for filename in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                print(f'Failed to delete {file_path}. Reason: {e}')
+
+    # Track already processed outputs
+    now_have = glob('F:\\out_have_gpp_t\\output\\*.tif')
+
+    # Loop through all years and months from 1982 to 2020
+    for year in range(1982, 2021):
+        for month in ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]:
+            nc_file = []
+            # Skip if output already exists for this date (e.g., the 2nd day of each month)
+            if f'F:\\out_have_gpp_t\\output\\predicted_{year}{month}02.tif' in now_have:
+                print('Output already exists, skipping...')
+                break
+
+            # Gather available ERA5 NetCDF files for required variables
+            for var in var_down:
+                filename = f"F:\\down_sum\\era5_{year}_{month}_{var}.nc"
+                if filename in file_name:
+                    nc_file.append(filename)
+                else:
+                    print(f'{filename} is missing')
+                    break
+
+            fields = ['surface_latent_heat_flux', 'surface_sensible_heat_flux', 'surface_net_solar_radiation']
+            fields2 = ['temperature']
+
+            # Proceed only if all 10 required NetCDF files are available
+            if len(nc_file) == 10:
+                # Copy files to mid processing folder
+                for file_nc in nc_file:
+                    shutil.copy(file_nc, 'F:\\out_have_gpp_t\\mid_caulate')
+
+                # Extract shortwave, latent, sensible heat flux and compute ground heat flux (G)
+                result = [item for item in nc_file if any(field in item for field in fields)]
+                years_ca = result[0][17:24]
+                ds1 = xr.open_dataset(result[0])
+                ds2 = xr.open_dataset(result[1])
+                ds3 = xr.open_dataset(result[2])
+                var1 = ds1['mslhf'] * (-1)
+                var2 = ds2['msshf'] * (-1)
+                var3 = ds3['ssr']
+                
+                # Save intermediate flux components
+                xr.Dataset({"mslhf": var1}).to_netcdf(f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_lh.nc')
+                xr.Dataset({"msshf": var2}).to_netcdf(f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_sh.nc')
+                xr.Dataset({"rn": var3/3600}).to_netcdf(f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_rn.nc')
+
+                G_F_MDS = -(var3 / 3600 - (var1 + var2))  # Ground heat flux
+                xr.Dataset({"gf": G_F_MDS}).to_netcdf(f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_gf.nc')
+
+                # Process temperature-related variables (Tair, VPD, Tsoil)
+                result_t = [item for item in nc_file if any(field in item for field in fields2)]
+                ts1 = xr.open_dataset(result_t[0])
+                ts2 = xr.open_dataset(result_t[1])
+                ts3 = xr.open_dataset(result_t[2])
+                tvar1 = ts1['t2m'] - 273.15  # Air temperature (K to °C)
+                tvar2 = (0.66 * np.exp(17.5 * (ts1['t2m'] - 273.15)/((ts1['t2m'] - 273.15) + 240.978)) -
+                         0.66 * np.exp(17.5 * (ts2['d2m'] - 273.15)/((ts2['d2m'] - 273.15) + 240.978))) * 10  # VPD (hPa)
+                tvar3 = ts3['stl1'] - 273.15  # Soil temperature
+
+                # Save processed temperature variables
+                xr.Dataset({"TA_F": tvar1}).to_netcdf(f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_TA_F.nc')
+                xr.Dataset({"VPD_F": tvar2}).to_netcdf(f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_VPD_F.nc')
+                xr.Dataset({"TS_F_MDS_1": tvar3}).to_netcdf(f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_TS_F_MDS_1.nc')
+
+                # Process soil moisture
+                v_w = xr.open_dataset(f'F:\\down_sum\\era5_{years_ca}_volumetric_soil_water_layer_1.nc')
+                v_w_v = v_w['swvl1'] * 100.0  # Convert to percentage
+                xr.Dataset({"SWC_F_MDS_1": v_w_v}).to_netcdf(f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_SWC_F_MDS_1.nc')
+
+                # List of prepared features to be copied to prediction folder
+                list_need_copy = [
+                    f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_TA_F.nc',
+                    f'F:\\down_sum\\era5_{years_ca}_mean_surface_downward_long_wave_radiation_flux.nc',
+                    f'F:\\down_sum\\era5_{years_ca}_mean_surface_downward_short_wave_radiation_flux.nc',
+                    f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_lh.nc',
+                    f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_sh.nc',
+                    f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_VPD_F.nc',
+                    f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_gf.nc',
+                    f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_TS_F_MDS_1.nc',
+                    f'F:\\out_have_gpp_t\\mid_caulate\\era5_{years_ca}_SWC_F_MDS_1.nc'
+                ]
+
+                # Copy required NetCDF files to prediction input folder
+                for need_copy in list_need_copy:
+                    shutil.copy(need_copy, 'F:\\out_have_gpp_t\\use_caluater')
+
+                # Run model prediction pipeline
+                process_nc_files_by_time(input_directory, output_directory, land_use)
+
+                # Clean up intermediate folders after processing
+                delete_files_in_folder('F:\\out_have_gpp_t\\mid_caulate')
+                delete_files_in_folder('F:\\out_have_gpp_t\\use_caluater')
