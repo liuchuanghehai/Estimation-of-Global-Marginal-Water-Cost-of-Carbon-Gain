@@ -1,0 +1,133 @@
+# Basic library imports and configuration
+import os
+import pickle
+import time
+import warnings
+
+warnings.simplefilter('ignore')  # Ignore all warnings to keep output clean
+
+# Data visualization and geospatial processing libraries
+import contextily as ctx              # For adding basemap tiles to plots
+import geopandas as gpd              # Geospatial data manipulation
+import jax                           # High-performance computing library used for optimization
+import matplotlib.pyplot as plt      # Plotting
+import numpy as np
+from cartopy import crs as ccrs      # Coordinate reference systems for maps
+from shapely.geometry import Point   # For point geometries
+from mpl_toolkits.axes_grid1 import make_axes_locatable  # For advanced plot layout control
+
+# Custom package for Bayesian Neural Fields
+from bayesnf import BayesianNeuralFieldMAP
+import pandas as pd
+
+df_data = pd.read_excel('traning data.xlsx', index_col=0, parse_dates=['TIMESTAMP']).dropna()
+print('Data loaded successfully')
+
+# Filter to include only records with selected land use types (1 to 7)
+select_values = [1, 2, 3, 4, 5, 6, 7]
+df_use_data = df_data[df_data['landuse'].isin(select_values)]
+
+# Shuffle data for random train-test split
+spilt_ratio = 0.7  # 70% training, 30% testing
+random_state = 40  # Seed for reproducibility
+df_shuffled = df_use_data.sample(frac=1, random_state=random_state)  # Shuffle the data
+df_use_data = df_shuffled
+
+# Split data into training and testing sets
+spilt_index = int(len(df_use_data) * spilt_ratio)
+df_train = df_use_data.iloc[:spilt_index]
+df_test = df_use_data.iloc[spilt_index:]
+
+# Free memory by deleting intermediate variables
+del df_data, df_use_data, df_shuffled
+
+# Import spatiotemporal model definition
+from bayesnf.spatiotemporal import BayesianNeuralFieldMAP
+
+# Initialize the Bayesian Neural Field model
+model = BayesianNeuralFieldMAP(
+  width=256,              # Number of hidden units in each layer
+  depth=4,                # Number of layers in the neural network
+  freq='W',               # Time frequency: weekly
+  feature_cols=[          # Input feature columns (predictors)
+      'TIMESTAMP',
+      'TA_F',             # Air temperature
+      'SW_IN_F',          # Shortwave incoming radiation
+      'LW_IN_F',          # Longwave incoming radiation
+      'VPD_F',            # Vapor Pressure Deficit
+      'TS_F_MDS_1',       # Soil temperature
+      'SWC_F_MDS_1',      # Soil water content
+      'G_F_MDS',          # Ground heat flux
+      'LE_F_MDS',         # Latent heat flux
+      'H_F_MDS'           # Sensible heat flux
+  ],
+  target_col='GPP_NT_VUT_REF',  # Target variable: gross primary production
+  observation_model='NORMAL',   # Assume normal distribution of errors
+  timetype='index',             # Time is handled as datetime index
+  standardize=[                 # Features to be standardized (mean=0, std=1)
+      'TA_F',
+      'SW_IN_F',
+      'LW_IN_F',
+      'VPD_F',
+      'TS_F_MDS_1',
+      'SWC_F_MDS_1',
+      'G_F_MDS',
+      'LE_F_MDS',
+      'H_F_MDS'
+  ]
+)
+
+# Additional variables list (optional, used for downstream analysis or plotting)
+LIST_NEED = [
+    'TIMESTAMP', 'TA_F', 'VPD_F', 'GPP_NT_VUT_REF',
+    'SW_IN_F', 'LW_IN_F', 'P_F', 'WS_F', 'NETRAD', 'CO2_F_MDS',
+    'SWC_F_MDS_1', 'LE_CORR', 'H_CORR'
+]
+
+print('Model initialized.')
+
+# Start model training
+star_time = time.time()
+
+# Fit the model using Maximum A Posteriori (MAP) estimation
+model, param = model.fit(
+    df_train,
+    seed=jax.random.PRNGKey(0),  # Random seed for model initialization
+    ensemble_size=8,             # Number of ensemble particles
+    num_epochs=3000              # Number of training epochs
+)
+
+print('Training completed.')
+
+# Save trained model parameters to file
+params = param._asdict()
+np.savez('model_GPP.npz', **params)
+
+# Print time cost
+end_time = time.time()
+print(f'time cost:{end_time - star_time}')
+
+# Plot training loss over epochs for each particle
+losses = np.row_stack(model.losses_)  # Stack losses from all ensemble members
+fig, ax = plt.subplots(figsize=(5, 3), tight_layout=True)
+ax.plot(losses.T, alpha=0.5)  # Individual particle losses
+ax.plot(np.mean(losses, axis=0), color='k', linewidth=3)  # Mean loss
+ax.set_xlabel('Epoch')
+ax.set_ylabel('Negative Joint Probability')
+ax.set_yscale('log', base=10)
+
+# Predict on test data using the trained model
+yhat, yhat_quantiles = model.predict(df_test, quantiles=(0.5, 0.6, 0.975))  # Predict median and quantiles
+
+# Scatter plot of true vs. predicted GPP
+fig, ax = plt.subplots(figsize=(5,3), tight_layout=True)
+ax.scatter(df_test.GPP_NT_VUT_REF, yhat_quantiles[0], marker='.', color='k')  # Median predictions
+ax.plot([0, 50], [0, 50], color='red')  # 1:1 line
+ax.set_xlabel('True Value')
+ax.set_ylabel('Predicted Value1')
+plt.show()
+
+# Compute R² score for prediction accuracy
+from sklearn.metrics import r2_score
+r2 = r2_score(df_test.GPP_NT_VUT_REF, yhat_quantiles[0])
+print(r2)
