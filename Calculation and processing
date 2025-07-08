@@ -1,0 +1,551 @@
+from rasterio.transform import from_bounds
+import glob
+from osgeo import gdal,osr
+import tqdm
+import numpy as np
+import xarray as xr
+from datetime import datetime
+from scipy.ndimage import zoom
+from rasterio.transform import from_origin
+import rasterio
+import pandas as pd
+import os
+import rasterio
+from scipy.stats import linregress, theilslopes
+from rasterio import Affine
+from rasterio.enums import Resampling
+import rioxarray
+from collections import defaultdict
+from basis function import resample_grid_with_empty_row,get_data
+from statsmodels import robust
+from itertools import combinations
+
+# Function: Compute daily λ values and export as monthly NetCDF files
+def fun1():
+    file_name = glob.glob('G:\\down_sum' + '\\*.nc')
+    fields2 = ['temperature']
+
+    # Read and resample DEM to 0.25° resolution
+    dem = get_data(f'G:\\et_t\\土壤\\原始DEM拼接后\\new.tif')
+    new_dem = resample_grid_with_empty_row(dem, 1 / 120, 0.25)
+    cols_half = new_dem.shape[1] // 2
+    # Rearrange columns: move second half to the front
+    adjusted_data1 = np.hstack((new_dem[:, cols_half:], new_dem[:, :cols_half]))
+    new_dem = adjusted_data1
+    new_dem[new_dem <= -500] = 0
+    new_dem[new_dem <= 0] = 0
+
+    # Calculate air pressure from DEM using barometric formula
+    pa_h = 101325 * np.exp(-9.8 * 0.0289644 * new_dem / 8.31447 / 288.15)
+
+    # Read GPP lower 5th percentile
+    site_gpp_lim = 'G:\\GPPdaily\\GPP南京大学居为民\\lower_percentile_5.tif'
+    new_data_lim, new_transform_lim = jisuan1_fanwei1(site_gpp_lim)
+    cols_half_lim = new_data_lim.shape[1] // 2
+    adjusted_data1_lim = np.hstack((new_data_lim[:, cols_half_lim:], new_data_lim[:, :cols_half_lim]))
+    gpp_lim = adjusted_data1_lim
+    new_resolution_grid_lim = resample_grid_with_empty_row(gpp_lim, 4 / 55, 0.25)
+    gpp_lim = np.nan_to_num(new_resolution_grid_lim, nan=0.0)
+
+    # Read GPP upper 95th percentile
+    site_gpp_max = 'G:\\GPPdaily\\GPP南京大学居为民\\upper_percentile_95.tif'
+    new_data_max, new_transform_max = jisuan1_fanwei1(site_gpp_max)
+    cols_half_max = new_data_max.shape[1] // 2
+    adjusted_data1_max = np.hstack((new_data_max[:, cols_half_max:], new_data_max[:, :cols_half_max]))
+    gpp_max = adjusted_data1_max
+    new_resolution_grid_max = resample_grid_with_empty_row(gpp_max, 4 / 55, 0.25)
+    gpp_max = np.nan_to_num(new_resolution_grid_max, nan=0.0)
+
+    for year in range(1985, 2022):
+        for mon in ["01", ..., "12"]:
+            # Load temperature and dewpoint data
+            tem = f'G:\\down_sum\\era5_{year}_{mon}_2m_temperature.nc'
+            d_tem = f'G:\\down_sum\\era5_{year}_{mon}_2m_dewpoint_temperature.nc'
+            ts1 = xr.open_dataset(tem)
+            ts2 = xr.open_dataset(d_tem)
+            tvar1 = ts1['t2m'] - 273.15  # Convert to Celsius
+
+            # Adjust pressure based on elevation and temperature
+            pa_h = 101325 * ((ts1['t2m']) / (ts1['t2m'] + 0.0065 * new_dem)) ** 5.625
+            fw = 1 + 0.0007 + pa_h * 3.46e-6
+
+            # Calculate VPD using dewpoint
+            tvar2 = 6.112 * fw * np.exp(
+                (17.67 * (ts1['t2m'] - 273.15)) / ((ts1['t2m'] - 273.15) + 243.5)) - \
+                    6.112 * fw * np.exp(
+                (17.67 * (ts2['d2m'] - 273.15)) / ((ts2['d2m'] - 273.15) + 243.5))
+
+            # Create temperature mask: only keep areas where average T ≥ 0°C
+            air_mid = tvar1.values * 1
+            air_t_mean = sum(air_mid)  # Sum over time
+            air_t_mean[air_t_mean >= 0] = 1
+            air_t_mean[air_t_mean < 0] = np.nan
+
+            # Load transpiration prediction
+            T = f'G:\\out_have_lai_t\\out_mid\\predicted_{year}{mon}{len(ts1["valid_time"])}.nc'
+            ts3 = xr.open_dataset(T)
+            tvar3 = ts3['pred_T']
+
+            for day_len in range(2, len(ts1['valid_time']) + 1):
+                if mon == '02' and day_len == 29:
+                    print("Skipping Feb 29")
+                    continue
+
+                # Load daily GPP
+                day_of_year = datetime.strptime(f'{year}{mon}{day_len:02}', "%Y%m%d").timetuple().tm_yday
+                site = f"G:\\GPPdaily\\GPP南京大学居为民\\result\\{year}GPP\\GPP_{year}_{day_of_year}.tif"
+                new_data, _ = jisuan1_fanwei1(site)
+                cols_half = new_data.shape[1] // 2
+                adjusted_data1 = np.hstack((new_data[:, cols_half:], new_data[:, :cols_half]))
+                gpp = adjusted_data1
+                gpp = resample_grid_with_empty_row(gpp, 4 / 55, 0.25)
+                gpp = np.nan_to_num(gpp, nan=0.0)
+
+                # Apply GPP masks
+                gpp_1[gpp_1 <= 0.1] = np.nan
+                gpp_le = gpp_1 * air_t_mean
+
+                # Load T and calculate WUE = GPP / T
+                air_temperature = tvar1[day_len - 1]
+                T_pred = tvar3[day_len - 2]
+                WUE = gpp_le / T_pred
+                WUE = WUE.values
+                
+                # Load CO2 (pre-2015: TIFF; post-2015: OCO-2 netCDF)
+                if year < 2015:
+                    co2 = get_data(f'G:\\CO2_Global_result\\month\\CO2_{year}{mon}.tif')
+                    new_co2 = resample_grid_with_empty_row(co2, 1, 0.25)
+                    cols_half = new_co2.shape[1] // 2
+                    new_co2 = np.hstack((new_co2[:, cols_half:], new_co2[:, :cols_half]))
+                else:
+                    co2_all = xr.open_dataset(f'G:\\co2\\co2\\oco2_GEOS_L3CO2_month_{year}{mon}_B10206Ar.nc4')
+                    co2_data = co2_all['XCO2'] * 1e6
+                    cols_half = co2_data.shape[1] // 2
+                    adjusted_data_co2 = np.hstack((co2_data[:, cols_half:], co2_data[:, :cols_half]))
+                    new_co2 = np.delete(adjusted_data_co2, -1, axis=0)
+
+                # Calculate gamma*
+                VPD = 1e3 * 100 * tvar2[day_len - 1] / pa_h[day_len - 1]
+                sco = 2800 * np.exp((air_temperature - 25) * (-24460) / (298 * 8.3143 * (air_temperature + 273)))
+                glamm = pa_h[day_len - 1] * 0.5 * 0.2095 / sco
+                glamm_mol_mol = 1e6 * glamm / pa_h[day_len - 1]
+
+                # Compute λ using two formulations
+                lambda_1 = (new_co2 - glamm_mol_mol) / 1.6 / VPD / WUE / WUE
+                lambda_2 = ((new_co2 - 1.6 * VPD * WUE) / 2.2 / WUE) ** 2 / glamm_mol_mol / VPD
+
+                # Select minimum of the two estimates
+                lambda_3 = np.minimum(lambda_1, lambda_2) * 1000
+                lambda_3[lambda_3 < 0] = 0
+
+                # Save into the dataset
+                ds_save = xr.open_dataset(tem)
+                var_name_old = 't2m'
+                ds_save[var_name_old][day_len - 1, :, :] = lambda_3
+
+            # Finalize and save monthly NetCDF
+            ds_save = ds_save.rename({var_name_old: 'lambda'})
+            ds_save['lambda'].attrs.update({
+                'units': 'mol/mol',
+                'GRIB_name': 'lambda',
+                'GRIB_shortName': 'lambda',
+                'long_name': 'lambda',
+                'GRIB_units': 'mol/mol',
+                'GRIB_cfVarName': 'lambda'
+            })
+            ds_save = ds_save['lambda'][1:, :, :]
+            output_path = os.path.join('F:\\new_lambda', f"lambda_{year}{mon}.nc")
+            ds_save.to_netcdf(output_path)
+            print(f"Saved: {output_path}")
+# Function: Convert lambda NetCDF (or GeoTIFF) files to raster stacks,
+# calculate long-term mean, Sen's slope, and linear regression trend
+def fun2():
+    # Set input/output folders
+    folder = "F:\\mean_10"  # Folder containing lambda GeoTIFFs
+    output_folder = "F:\\lambda_结果"
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Load all GeoTIFF files matching the pattern
+    tif_files = sorted(glob.glob(os.path.join(folder, 'lammba_*.tif')))
+    years = [int(os.path.basename(f).split('_')[-1].split('.')[0]) for f in tif_files]
+
+    stack = []  # To store raster data
+    meta = None  # To store metadata from first raster
+
+    for tif in tqdm.tqdm(tif_files, desc="Reading GeoTIFF rasters"):
+        with rasterio.open(tif) as src:
+            if meta is None:
+                meta = src.meta.copy()
+            data = src.read(1).astype(np.float32)
+            data[data == src.nodata] = np.nan
+            # Mask extreme values (remove top 5% and values > 10000)
+            aa = np.nanpercentile(data, 95)
+            data[data >= aa] = np.nan
+            data[data >= 10000] = 10000
+            stack.append(data)
+
+    # Stack all data into a 3D array (time, rows, cols)
+    stack = np.array(stack)
+    years = np.array(years)
+
+    # Compute pixel-wise mean over time
+    mean_array = np.nanmean(stack, axis=0)
+
+    # Initialize trend arrays
+    sen_slope = np.full_like(mean_array, np.nan)
+    linear_slope = np.full_like(mean_array, np.nan)
+
+    rows, cols = mean_array.shape
+    print("Computing trends for each pixel...")
+
+    # Loop through each pixel to compute trend
+    for i in tqdm.tqdm(range(rows), desc="Trend calculation"):
+        for j in range(cols):
+            pixel_series = stack[:, i, j]
+            if np.all(np.isnan(pixel_series)):
+                continue
+            try:
+                # Compute Sen's Slope (robust non-parametric trend)
+                sen = theilslopes(pixel_series, years, 0.95)[0]
+                # Compute linear regression slope
+                slope, _, _, _, _ = linregress(years, pixel_series)
+                sen_slope[i, j] = sen
+                linear_slope[i, j] = slope
+            except Exception:
+                continue  # Skip invalid pixels
+
+    # Update metadata for writing output
+    meta.update(dtype=rasterio.float32, count=1, nodata=np.nan)
+
+    # Helper function to write array as GeoTIFF
+    def write_tif(filename, array):
+        with rasterio.open(filename, 'w', **meta) as dst:
+            dst.write(array.astype(np.float32), 1)
+
+    # Save outputs
+    write_tif(os.path.join(output_folder, 'mean.tif'), mean_array)
+    write_tif(os.path.join(output_folder, 'sen_slope.tif'), sen_slope)
+    write_tif(os.path.join(output_folder, 'linear_slope.tif'), linear_slope)
+
+    print("All outputs saved to:", output_folder)
+# Function: Extract pixel-level λ values using a land cover or AI zone mask,
+# flatten all rasters, and save as Excel table (each column = time or layer)
+def fun3(site='C:\\Users\\Admin\\Desktop\\new_lambda',
+         out='C:\\Users\\Admin\\Desktop\\newlambda_landuse.xlsx'):
+    # Land cover or aridity classification raster (used for zonal statistics)
+    ras_2 = 'C:\\Users\\Admin\\Desktop\\土地.tif'
+
+    # Reference raster for spatial masking (only keep valid pixels)
+    cankao = lambda_统一函数.get_data('C:\\Users\\Admin\\Desktop\\range_yx.tif')
+    data3 = []
+
+    # Read zone raster (land cover or AI)
+    with rasterio.open(ras_2) as src:
+        data = src.read(1).astype(float)
+        bounds = src.bounds
+
+        # If the data is missing a row (721 vs. 720), append NaN row
+        if data.shape[0] != 721:
+            nan_row = np.full((1, data.shape[1]), np.nan)
+            adjusted_data_co2 = np.vstack((data, nan_row))
+
+        # If longitude range is 0–360, rearrange columns to -180 to 180
+        if bounds.left < 0:
+            cols_half = data.shape[1] // 2
+            adjusted_data_co2 = np.hstack((data[:, cols_half:], data[:, :cols_half]))
+            data = adjusted_data_co2
+
+        nodata = src.nodata
+        data = data * cankao  # Apply region mask
+        data2 = np.array(data).flatten().tolist()
+    data3.append(data2)
+
+    # Loop through all .tif λ rasters
+    list_use = glob.glob(site + '\\*.tif')
+    for site_ues in list_use:
+        print(site_ues)
+        with rasterio.open(site_ues) as src:
+            data = src.read(1).astype(float)
+            bounds = src.bounds
+
+            # Handle longitude shift if needed
+            if bounds.left < 0:
+                cols_half = data.shape[1] // 2
+                adjusted_data_co2 = np.hstack((data[:, cols_half:], data[:, :cols_half]))
+                nan_row = np.full((1, adjusted_data_co2.shape[1]), np.nan)
+                adjusted_data_co2 = np.vstack((adjusted_data_co2, nan_row))
+                data = adjusted_data_co2
+
+            nodata = src.nodata
+            data1 = np.array(data).flatten().tolist()
+        data3.append(data1)
+
+    # Convert list to DataFrame and export to Excel
+    data3 = pd.DataFrame(data3).T
+    data3.to_excel(out)
+# Function: Bin λ-related variables by aridity index (AI) intervals,
+# compute mean, std, count, median, MAD for each bin, and export to Excel
+def fun4(var='new_lambda', interval=300):
+    # Read the CSV file containing λ and AI values
+    data = pd.read_csv(f"C:\\Users\\Admin\\Desktop\\AI_GX.csv")
+    df = pd.DataFrame(data)
+
+    # Identify all numeric columns
+    numeric_columns = df.select_dtypes(include=['number']).columns.tolist()
+    bin_col = 'AI'  # Column to group by (AI index)
+
+    if bin_col not in numeric_columns:
+        raise ValueError(f"Column '{bin_col}' not found in data!")
+
+    # Compute bin edges based on AI and specified interval
+    x_min = df[bin_col].min()
+    x_max = df[bin_col].max()
+    bins = np.arange(x_min - 0.1, x_max + interval, interval)
+
+    # Assign bin labels for each row
+    df['bin'] = pd.cut(df[bin_col], bins)
+
+    # Calculate bin centers for plotting later
+    bins_2 = np.insert(bins[1:], -1, 65683)  # Artificial adjustment
+    k = 0.5 * bins + bins_2 * 0.5
+
+    results = {}  # Store output per variable
+
+    # Loop through each numeric column and aggregate by bin
+    for col in tqdm.tqdm(numeric_columns):
+        result = df.groupby('bin')[col].agg(['mean', 'std', 'count', 'median'])
+
+        # Compute MAD (median absolute deviation), scaled to std-like units
+        mad = df.groupby('bin')[col].apply(robust.mad)
+        result['mad'] = mad * 1.4826
+        result['sy'] = k[:-1]  # Bin centers
+        results[col] = result
+
+    # Export each variable's summary to a separate Excel sheet
+    output_path = f"F:\\多元数据的输出\\new_wue_bh\\弹性贡献—3\\{var}.xlsx"
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        for col, res in results.items():
+            if not res.empty:
+                res.to_excel(writer, sheet_name=col, index=True)
+            else:
+                print(f"Warning: result for {col} is empty. Skipping.")
+
+    print(f"Processing complete. Saved to {output_path}")
+# Function: Compute λ zonal statistics using AI classification (1–8)
+# For each raster, calculate per-class means (or medians) and confidence intervals
+def fun5(site, name_use='mean'):
+    list_use = glob.glob(site + '\\*.tif')
+
+    # Reference region mask
+    cankao = get_data('C:\\Users\\Admin\\Desktop\\range_yx.tif')
+
+    # AI classification raster (1–8 classes)
+    classs_site = 'C:\\Users\\Admin\\Desktop\\ai_8lei.tif'
+    with rasterio.open(classs_site) as src:
+        data = src.read(1).astype(float)
+        bounds = src.bounds
+
+        # If longitude range is 0–360, rearrange columns to -180–180
+        if bounds.left < 0:
+            cols_half = data.shape[1] // 2
+            adjusted_data_co2 = np.hstack((data[:, cols_half:], data[:, :cols_half]))
+            nan_row = np.full((1, adjusted_data_co2.shape[1]), np.nan)
+            data = np.vstack((adjusted_data_co2, nan_row))
+
+        nodata = src.nodata
+        data_ai = data * cankao
+        data_ai[data_ai == nodata] = np.nan
+        data_ai[data_ai == 0] = np.nan
+
+    # Output Excel path
+    excel_site = 'C:\\Users\\Admin\\Desktop\\eight_lambda.xlsx'
+    use_datafram_mid = []
+
+    # Loop over each λ raster
+    for site_n in list_use:
+        use_datafram = list(range(12))       # Store means or medians
+        use_data_std = list(range(12))       # Store confidence intervals
+        group_1_4 = []  # AI classes 1–4 (dryland)
+        group_5_8 = []  # AI classes 5–8 (humid)
+        group_all = [] # All valid data
+        year = site_n.split('\\')[-1].split('_')[1]
+
+        with rasterio.open(classs_site) as zone_src, rasterio.open(site_n) as value_src:
+            zone = zone_src.read(1)
+            value = value_src.read(1)
+            zone_nodata = zone_src.nodata
+            value_nodata = value_src.nodata
+
+            # Rearrange if longitude range is 0–360
+            if zone_src.bounds.left < 0:
+                cols_half = zone.shape[1] // 2
+                zone = np.hstack((zone[:, cols_half:], zone[:, :cols_half]))
+                zone = np.vstack((zone, np.full((1, zone.shape[1]), np.nan)))
+
+            if value_src.bounds.left < 0:
+                cols_half = value.shape[1] // 2
+                value = np.hstack((value[:, cols_half:], value[:, :cols_half]))
+                value = np.vstack((value, np.full((1, value.shape[1]), np.nan)))
+
+            value[value == 0] = np.nan
+            value[value >= np.nanpercentile(value, 95)] = np.nan
+            value = value * cankao  # Apply spatial mask
+
+        # Global stats (across all valid pixels)
+        a = [np.nanmean(value), 1.96 * np.nanstd(value)**2 / np.count_nonzero(~np.isnan(value))]
+
+        valid_mask = (zone != zone_nodata) & (value != value_nodata)
+        categories = np.unique(zone[valid_mask])
+
+        use_datafram[0] = year
+        for cat in categories:
+            mask = (zone == cat) & valid_mask
+            vals = value[mask]
+            vals_no_nan = vals[~np.isnan(vals)]
+            n = len(vals_no_nan)
+
+            if name_use == 'mean':
+                mean_val = np.nanmean(vals)
+                if ~np.isnan(mean_val):
+                    use_datafram[int(cat)] = mean_val
+                    use_data_std[int(cat)] = 1.96 * np.nanstd(vals) / np.sqrt(n)
+                    group_all.extend(vals)
+                if 1 <= cat <= 4:
+                    group_1_4.extend(vals)
+                elif 5 <= cat <= 8:
+                    group_5_8.extend(vals)
+
+            elif name_use == 'mid':
+                mean_val = np.nanmedian(vals)
+                if ~np.isnan(mean_val):
+                    use_datafram[int(cat)] = mean_val
+                    use_data_std[int(cat)] = 1.4826 * robust.mad(vals_no_nan) / np.sqrt(n)
+                    group_all.extend(vals)
+                if 1 <= cat <= 4:
+                    group_1_4.extend(vals)
+                elif 5 <= cat <= 8:
+                    group_5_8.extend(vals)
+
+        # Compute dryland/humid/global stats
+        if name_use == 'mean':
+            g_1_4 = np.nanmean(group_1_4)
+            g_5_8 = np.nanmean(group_5_8)
+            g_all = np.nanmean(group_all)
+            use_datafram[9:12] = [g_1_4, g_5_8, g_all]
+            use_data_std[9] = 1.96 * np.nanstd(group_1_4) / np.sqrt(len(group_1_4))
+            use_data_std[10] = 1.96 * np.nanstd(group_5_8) / np.sqrt(len(group_5_8))
+            use_data_std[11] = 1.96 * np.nanstd(group_all) / np.sqrt(len(group_all))
+
+        elif name_use == 'mid':
+            g_1_4 = np.nanmedian(group_1_4)
+            g_5_8 = np.nanmedian(group_5_8)
+            g_all = np.nanmedian(group_all)
+            use_datafram[9:12] = [g_1_4, g_5_8, g_all]
+            use_data_std[9] = 1.4826 * robust.mad(np.array(group_1_4)[~np.isnan(group_1_4)]) / np.sqrt(len(group_1_4))
+            use_data_std[10] = 1.4826 * robust.mad(np.array(group_5_8)[~np.isnan(group_5_8)]) / np.sqrt(len(group_5_8))
+            use_data_std[11] = 1.4826 * robust.mad(np.array(group_all)[~np.isnan(group_all)]) / np.sqrt(len(group_all))
+
+        use_datafram_mid.append(use_datafram)
+        use_datafram_mid.append(use_data_std)
+
+    # Export result
+    out_data = pd.DataFrame(use_datafram_mid)
+    out_data.to_excel(excel_site)
+# Function: Compute λ zonal statistics by binary classification (e.g., dry vs. wet)
+# For each raster, calculate mean and confidence intervals for each class and all data
+def fun6(site, excel_site='C:\\Users\\Admin\\Desktop\\ganshi.xlsx'):
+    list_use = glob.glob(site + '\\*.tif')
+
+    # Reference region mask (study area)
+    cankao = lambda_统一函数.get_data('C:\\Users\\Admin\\Desktop\\range_yx.tif')
+
+    # Binary dry/wet classification raster (e.g., 1 = dry, 2 = wet)
+    classs_site = 'C:\\Users\\Admin\\Desktop\\干湿.tif'
+    with rasterio.open(classs_site) as src:
+        data = src.read(1).astype(float)
+        bounds = src.bounds
+
+        # If longitude range is 0–360, rearrange to -180–180
+        if bounds.left < 0:
+            cols_half = data.shape[1] // 2
+            adjusted_data_co2 = np.hstack((data[:, cols_half:], data[:, :cols_half]))
+            data = adjusted_data_co2
+
+        nodata = src.nodata
+        data_ai = data * cankao
+        data_ai[data_ai == nodata] = np.nan
+        data_ai[data_ai == 0] = np.nan
+
+    use_datafram_mid = []
+    yearaa = 0
+    year_count = 0
+
+    for site_n in tqdm.tqdm(list_use):
+        use_datafram = list(range(7))  # Store [year, class1_mean, class1_err, class2_mean, class2_err, total_mean, total_err]
+        group_all = []
+
+        year = site_n.split('\\')[-1]  # E.g., lammba_1999.tif
+
+        # Open classification and λ raster
+        with rasterio.open(classs_site) as zone_src, rasterio.open(site_n) as value_src:
+            zone = zone_src.read(1)
+            value = value_src.read(1) * cankao
+            zone_nodata = zone_src.nodata
+            value_nodata = value_src.nodata
+
+            # Rearrange if longitude is 0–360
+            if zone_src.bounds.left < 0:
+                cols_half = zone.shape[1] // 2
+                zone = np.hstack((zone[:, cols_half:], zone[:, :cols_half]))
+
+            if value_src.bounds.left < 0:
+                cols_half = value.shape[1] // 2
+                value = np.hstack((value[:, cols_half:], value[:, :cols_half]))
+
+            value[value == 0] = np.nan
+            value[value >= 10000] = 10000
+            value[np.isinf(value)] = np.nan
+
+            # For averaging over years
+            year_mid = value.copy()
+            year_mid[np.isnan(year_mid)] = 0
+            yearaa += year_mid
+            year_mid[year_mid != 0] = 1
+            year_count += year_mid
+
+        # Compute global statistics
+        a = [np.nanmean(value), 1.96 * np.nanstd(value)**2 / np.count_nonzero(~np.isnan(value))]
+
+        valid_mask = (zone != zone_nodata) & (value != value_nodata)
+        categories = np.unique(zone[valid_mask])
+
+        use_datafram[0] = year
+        for cat in categories:
+            mask = (zone == cat) & valid_mask
+            vals = value[mask]
+            vals_no_nan = vals[~np.isnan(vals)]
+            n = len(vals_no_nan)
+
+            mean_val = np.nanmean(vals)
+            if ~np.isnan(mean_val):
+                # Index: 1 = dry, 2 = wet
+                idx = 1 + (int(cat) - 1) * 2
+                use_datafram[idx] = mean_val
+                use_datafram[idx + 1] = 1.96 * np.nanstd(vals) / np.sqrt(n)
+                group_all.extend(vals)
+
+        # Global average across both classes
+        g_all = np.nanmean(group_all)
+        use_datafram[5] = g_all
+        use_datafram[6] = 1.96 * np.nanstd(group_all) / np.sqrt(len(group_all))
+
+        use_datafram_mid.append(use_datafram)
+
+    # Compute the average number of valid years per pixel (optional printout)
+    year_mid[year_mid == 0] = 1
+    yearaa = yearaa / year_count
+    print([np.nanmedian(yearaa), np.nanmean(yearaa)])
+
+    # Save as Excel
+    out_data = pd.DataFrame(use_datafram_mid)
+    out_data.to_excel(excel_site)
